@@ -1,22 +1,67 @@
 # set_pad_value 和模态打包调研报告
 
-## 1. set_pad_value 的引入时间
+## 1. pad_values 和 set_pad_value 的引入时间
 
-### 引入时间
+### pad_values 的引入（最初版本）
+`pad_values` 概念是在 **commit fd9ad817e** (2024年9月28日) 引入的，这个 commit 的标题是：
+```
+Organize image inputs (#1531)
+```
+
+#### 最初的设计
+在 commit fd9ad817e 中，引入了 `ImageInputs` 类：
+
+```python
+@dataclass
+class ImageInputs:
+    pixel_values: torch.Tensor
+    image_hash: int
+    image_sizes: Optional[list] = None
+    image_offsets: Optional[list] = None
+    pad_values: Optional[list] = None  # 列表，包含4个值
+    modalities: Optional[list] = None
+```
+
+#### pad_values 的计算方式（最初版本）
+```python
+@staticmethod
+def from_dict(obj, vocab_size):
+    # 将所有图片的哈希值组合成一个元组，然后计算哈希
+    ret = ImageInputs(
+        pixel_values=obj["pixel_values"],
+        image_hash=hash(tuple(obj["image_hashes"])),  # 所有图片哈希的组合
+    )
+    image_hash = ret.image_hash
+    # 从 image_hash 生成4个 pad_values
+    ret.pad_values = [
+        (image_hash) % vocab_size,
+        (image_hash >> 16) % vocab_size,
+        (image_hash >> 32) % vocab_size,
+        (image_hash >> 64) % vocab_size,
+    ]
+```
+
+**关键观察**：
+- 在引入 pad_values 时，**所有图片的哈希值被组合成一个 `image_hash`**（通过 `hash(tuple(obj["image_hashes"]))`）
+- 从这个单一的 `image_hash` 生成4个 `pad_values`
+- `pixel_values` 是一个 `torch.Tensor`，多张图片被组织在一个张量中
+- **这意味着在引入 pad_values 时，所有图片被组织在一起，共享同一个 image_hash 和 pad_values**
+
+### set_pad_value 的引入（重构版本）
 `set_pad_value` 方法是在 **commit 5cb552b1d** (2025年4月1日) 引入的，这个 commit 的标题是：
 ```
 refactor: multimodal data (#4754)
 ```
 
-### 引入背景
+#### 引入背景
 在引入 `set_pad_value` 之前：
-- `pad_values` 是 `MultimodalInputs` 类的一个列表字段 (`pad_values: Optional[list] = None`)
-- 所有模态数据的 pad values 都存储在一个列表中
+- `pad_values` 是 `MultimodalInputs`（之前是 `ImageInputs`）类的一个列表字段
+- 所有图片共享一个 `image_hash`，从这个 hash 生成多个 `pad_values`
 
 在引入 `set_pad_value` 之后：
 - 引入了 `MultimodalDataItem` 类，每个 item 代表一种模态的所有输入
-- 每个 `MultimodalDataItem` 有自己的 `pad_value` 字段
-- 通过 `set_pad_value()` 方法为每个 item 设置 pad value
+- 每个 `MultimodalDataItem` 有自己的 `pad_value` 字段（单个值，不再是列表）
+- 通过 `set_pad_value()` 方法为每个 item 单独计算 pad value
 
 ### set_pad_value 的实现
 ```python
@@ -40,7 +85,16 @@ pad_value 的计算方式：`pad_value = hash % (1 << 30)`，即对特征数据�
 
 ## 2. 模态打包机制
 
-### 设计理念
+### pad_values 引入时的打包情况（2024年9月）
+在最初引入 `pad_values` 时（commit fd9ad817e）：
+- **所有图片被组织在一起**：`pixel_values` 是一个 `torch.Tensor`，包含所有图片
+- **共享一个 image_hash**：所有图片的哈希值被组合成一个元组，然后计算哈希
+- **共享 pad_values**：从单一的 `image_hash` 生成4个 `pad_values`，所有图片使用相同的 pad_values
+- **支持 modalities 字段**：虽然存在 `modalities` 字段，但当时主要处理图片，多张图片共享同一个 hash 和 pad_values
+
+**结论**：在 pad_values 引入时，**多张图片是打包在一起的**，共享同一个 image_hash 和 pad_values。
+
+### MultimodalDataItem 引入时的打包情况（2025年4月）
 根据代码注释和实现，**sglang 在引入 MultimodalDataItem 时，确实默认将同一种模态打包在一起**。
 
 ### 证据
@@ -124,16 +178,35 @@ for modality in Modality.all():  # IMAGE, VIDEO, AUDIO
 
 ## 5. 总结
 
-1. **set_pad_value 引入时间**：
-   - 概念引入：2024年9月28日（commit fd9ad817e，引入 pad_values）
-   - 方法引入：2025年4月1日（commit 5cb552b1d，引入 set_pad_value 方法）
+### pad_values 引入时（2024年9月28日，commit fd9ad817e）
+1. **打包方式**：
+   - ✅ **是的**，在引入 pad_values 时，**所有图片被组织在一起**
+   - 多张图片的哈希值被组合成一个 `image_hash`：`hash(tuple(obj["image_hashes"]))`
+   - 从这个单一的 `image_hash` 生成4个 `pad_values`，所有图片共享这些 pad_values
+   - `pixel_values` 是一个 `torch.Tensor`，包含所有图片数据
 
-2. **模态打包**：
+2. **设计特点**：
+   - 所有图片共享同一个 image_hash 和 pad_values
+   - 支持 `modalities` 字段，但当时主要处理图片
+   - pad_values 是一个包含4个值的列表
+
+### set_pad_value 引入时（2025年4月1日，commit 5cb552b1d）
+1. **打包方式**：
    - ✅ **是的**，sglang 在引入 MultimodalDataItem 时，默认将同一种模态的所有输入打包到一个 MultimodalDataItem 中
    - 例如：3 张图片 + 1 个音频 = 2 个 MultimodalDataItem（1个IMAGE类型，1个AUDIO类型）
+   - 每种模态有自己独立的 `pad_value`（单个值，不再是列表）
 
-3. **设计目的**：
-   - 简化多模态数据的组织和管理
-   - 为每种模态单独计算和存储 pad_value（基于特征数据的哈希值）
-   - 支持按模态类型进行批量处理（在 embed_mm_inputs 中按模态分组处理）
-   - 提高 Radix Attention 的缓存效率（通过 pad_value 进行前缀匹配）
+2. **设计改进**：
+   - 从共享的 image_hash 改为每个 MultimodalDataItem 独立计算 hash 和 pad_value
+   - 支持真正的多模态（IMAGE、VIDEO、AUDIO），每种模态独立处理
+   - pad_value 从列表改为单个值：`pad_value = hash % (1 << 30)`
+
+### 演进过程
+- **2024年9月**：引入 pad_values，所有图片打包在一起，共享 hash 和 pad_values
+- **2025年4月**：引入 MultimodalDataItem 和 set_pad_value，按模态类型打包，每种模态独立计算 pad_value
+
+### 设计目的
+- 简化多模态数据的组织和管理
+- 为每种模态单独计算和存储 pad_value（基于特征数据的哈希值）
+- 支持按模态类型进行批量处理（在 embed_mm_inputs 中按模态分组处理）
+- 提高 Radix Attention 的缓存效率（通过 pad_value 进行前缀匹配）
